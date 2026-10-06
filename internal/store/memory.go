@@ -1,78 +1,66 @@
 package store
 
 import (
-	"fmt"
 	"sync"
 	"time"
 
 	"example.com/apiary-colony-service/internal/domain"
 )
 
-// Memory 是并发安全的内存仓储。所有写入都在写锁内完成状态校验，
-// 读取则通过 Snapshot 得到一致视图。
+// Memory 是并发安全的内存仓储。它持有唯一的锁，并把各类业务事实委托给
+// 各自的存储角色：写入方法在写锁内完成跨角色校验与修改，处于同一临界区；
+// 读取则通过 Snapshot 在一次读锁内得到一致视图。
 type Memory struct {
 	mu sync.RWMutex
 
-	apiaries    map[string]domain.Apiary
-	hives       map[string]domain.Hive
-	inspections map[string][]domain.Inspection
-	queens      map[string][]domain.Queen
-
-	inspectionSeq int
-	queenSeq      int
+	apiaries    apiaryTable
+	hives       hiveTable
+	inspections *inspectionLog
+	queens      *queenLedger
 }
 
 func NewMemory() *Memory {
 	return &Memory{
-		apiaries:    make(map[string]domain.Apiary),
-		hives:       make(map[string]domain.Hive),
-		inspections: make(map[string][]domain.Inspection),
-		queens:      make(map[string][]domain.Queen),
+		apiaries:    newApiaryTable(),
+		hives:       newHiveTable(),
+		inspections: newInspectionLog(),
+		queens:      newQueenLedger(),
 	}
 }
 
 func (m *Memory) CreateApiary(apiary domain.Apiary) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.apiaries[apiary.ID]; ok {
-		return domain.Conflict("蜂场 %q 已存在", apiary.ID)
-	}
-	m.apiaries[apiary.ID] = apiary
-	return nil
+	return m.apiaries.add(apiary)
 }
 
 func (m *Memory) GetApiary(id string) (domain.Apiary, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	apiary, ok := m.apiaries[id]
-	return apiary, ok
+	return m.apiaries.get(id)
 }
 
+// CreateHive 在写锁内确认蜂场存在并校验蜂箱编号唯一，再写入蜂箱。
 func (m *Memory) CreateHive(hive domain.Hive) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.apiaries[hive.ApiaryID]; !ok {
+	if !m.apiaries.has(hive.ApiaryID) {
 		return domain.NotFound("蜂场", hive.ApiaryID)
 	}
-	if _, ok := m.hives[hive.ID]; ok {
-		return domain.Conflict("蜂箱 %q 已存在", hive.ID)
-	}
-	m.hives[hive.ID] = hive
-	return nil
+	return m.hives.add(hive)
 }
 
 func (m *Memory) GetHive(id string) (domain.Hive, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	hive, ok := m.hives[id]
-	return hive, ok
+	return m.hives.get(id)
 }
 
 // AdvanceHive 在同一把写锁内完成状态读取、迁移校验与写入，避免并发迁移产生交错结果。
 func (m *Memory) AdvanceHive(hiveID string, target domain.HiveState, _ time.Time) (domain.Transition, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	hive, ok := m.hives[hiveID]
+	hive, ok := m.hives.get(hiveID)
 	if !ok {
 		return domain.Transition{}, domain.NotFound("蜂箱", hiveID)
 	}
@@ -85,7 +73,7 @@ func (m *Memory) AdvanceHive(hiveID string, target domain.HiveState, _ time.Time
 	}
 	from := hive.State
 	hive.State = target
-	m.hives[hiveID] = hive
+	m.hives.put(hive)
 	return domain.Transition{HiveID: hiveID, From: from, To: target}, nil
 }
 
@@ -94,22 +82,19 @@ func (m *Memory) AdvanceHive(hiveID string, target domain.HiveState, _ time.Time
 func (m *Memory) AddInspection(hiveID string, inspection domain.Inspection) (domain.Inspection, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	hive, ok := m.hives[hiveID]
+	hive, ok := m.hives.get(hiveID)
 	if !ok {
 		return domain.Inspection{}, domain.NotFound("蜂箱", hiveID)
 	}
 	if !hive.AcceptsInspection() {
 		return domain.Inspection{}, domain.InvalidState("蜂箱 %q 处于 %q 状态，不接受巡检", hiveID, hive.State)
 	}
-	m.inspectionSeq++
-	inspection.ID = fmt.Sprintf("inspection-%06d", m.inspectionSeq)
-	inspection.HiveID = hiveID
-	m.inspections[hiveID] = append(m.inspections[hiveID], inspection)
+	saved := m.inspections.append(hiveID, inspection)
 
-	observedAt := inspection.ObservedAt
+	observedAt := saved.ObservedAt
 	hive.LastInspectionAt = &observedAt
-	m.hives[hiveID] = hive
-	return inspection, nil
+	m.hives.put(hive)
+	return saved, nil
 }
 
 // AddQueen 关闭原有产卵蜂王并写入新蜂王，两件事在同一把锁内完成，
@@ -123,7 +108,7 @@ func (m *Memory) AddQueen(
 ) (domain.Queen, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	hive, ok := m.hives[hiveID]
+	hive, ok := m.hives.get(hiveID)
 	if !ok {
 		return domain.Queen{}, domain.NotFound("蜂箱", hiveID)
 	}
@@ -131,106 +116,43 @@ func (m *Memory) AddQueen(
 		return domain.Queen{}, domain.InvalidState("蜂箱 %q 处于 %q 状态，不接受换王", hiveID, hive.State)
 	}
 	if closeQueenID != "" {
-		if err := m.closeQueenLocked(hiveID, closeQueenID, closeState, now); err != nil {
+		if err := m.queens.close(hiveID, closeQueenID, closeState, now); err != nil {
 			return domain.Queen{}, err
 		}
 	}
-	m.queenSeq++
-	queen.ID = fmt.Sprintf("queen-%06d", m.queenSeq)
-	queen.HiveID = hiveID
-	queen.State = domain.QueenLaying
-	m.queens[hiveID] = append(m.queens[hiveID], queen)
+	saved := m.queens.append(hiveID, queen)
 
-	hive.ActiveQueenID = queen.ID
-	m.hives[hiveID] = hive
-	return queen, nil
-}
-
-func (m *Memory) closeQueenLocked(hiveID, queenID string, state domain.QueenState, now time.Time) error {
-	items := m.queens[hiveID]
-	for index, item := range items {
-		if item.ID != queenID {
-			continue
-		}
-		if !item.IsLaying() {
-			return domain.Conflict("蜂王 %q 已经关闭", queenID)
-		}
-		closedAt := now.UTC()
-		item.State = state
-		item.ClosedAt = &closedAt
-		items[index] = item
-		m.queens[hiveID] = items
-		return nil
-	}
-	return domain.Storage("蜂箱 %q 上的蜂王 %q 记录缺失", hiveID, queenID)
+	hive.ActiveQueenID = saved.ID
+	m.hives.put(hive)
+	return saved, nil
 }
 
 func (m *Memory) ListInspections(hiveID string) ([]domain.Inspection, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if _, ok := m.hives[hiveID]; !ok {
+	if _, ok := m.hives.get(hiveID); !ok {
 		return nil, domain.NotFound("蜂箱", hiveID)
 	}
-	items := m.inspections[hiveID]
-	out := make([]domain.Inspection, len(items))
-	copy(out, items)
-	return out, nil
+	return m.inspections.list(hiveID), nil
 }
 
 func (m *Memory) ListQueens(hiveID string) ([]domain.Queen, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if _, ok := m.hives[hiveID]; !ok {
+	if _, ok := m.hives.get(hiveID); !ok {
 		return nil, domain.NotFound("蜂箱", hiveID)
 	}
-	items := m.queens[hiveID]
-	out := make([]domain.Queen, len(items))
-	copy(out, items)
-	return out, nil
+	return m.queens.list(hiveID), nil
 }
 
 // Snapshot 返回深拷贝的一致视图，供汇总类读取使用。
 func (m *Memory) Snapshot() Snapshot {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	snapshot := Snapshot{
-		Apiaries:          make(map[string]domain.Apiary, len(m.apiaries)),
-		Hives:             make(map[string]domain.Hive, len(m.hives)),
-		InspectionsByHive: make(map[string][]domain.Inspection, len(m.inspections)),
-		QueensByHive:      make(map[string][]domain.Queen, len(m.queens)),
+	return Snapshot{
+		Apiaries:          m.apiaries.clone(),
+		Hives:             m.hives.clone(),
+		InspectionsByHive: m.inspections.clone(),
+		QueensByHive:      m.queens.clone(),
 	}
-	for id, apiary := range m.apiaries {
-		snapshot.Apiaries[id] = apiary
-	}
-	for id, hive := range m.hives {
-		snapshot.Hives[id] = cloneHive(hive)
-	}
-	for id, items := range m.inspections {
-		copied := make([]domain.Inspection, len(items))
-		copy(copied, items)
-		for index := range copied {
-			copied[index].Concerns = append([]string{}, items[index].Concerns...)
-		}
-		snapshot.InspectionsByHive[id] = copied
-	}
-	for id, items := range m.queens {
-		copied := make([]domain.Queen, len(items))
-		copy(copied, items)
-		for index := range copied {
-			if items[index].ClosedAt != nil {
-				closedAt := *items[index].ClosedAt
-				copied[index].ClosedAt = &closedAt
-			}
-		}
-		snapshot.QueensByHive[id] = copied
-	}
-	return snapshot
-}
-
-func cloneHive(hive domain.Hive) domain.Hive {
-	if hive.LastInspectionAt != nil {
-		observedAt := *hive.LastInspectionAt
-		hive.LastInspectionAt = &observedAt
-	}
-	return hive
 }
